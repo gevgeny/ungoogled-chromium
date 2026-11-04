@@ -1,0 +1,1040 @@
+# Sticky tabs: a tab remembers a home URL and a custom title.
+# Pinned tabs are always sticky; any other tab can be made sticky from the tab
+# context menu and moves right after the pinned tabs. Favicon dot shows state
+# (green at home, yellow after leaving). Home command / Cmd+Shift+H and
+# "Back to sticky URL" return to the home URL. State persists in the session
+# and, for pinned tabs, in the pinned_tabs pref.
+# See docs/sticky-tabs.md.
+
+diff --git a/chrome/browser/sessions/session_service_base.cc b/chrome/browser/sessions/session_service_base.cc
+index caa90c8e72..44eb4af029 100644
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -60,6 +60,9 @@
+ #include "content/public/browser/session_storage_namespace_handle.h"
+ #include "ui/base/mojom/window_show_state.mojom.h"
+ 
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
++#include "components/tabs/public/tab_interface.h"
++
+ #if BUILDFLAG(IS_MAC)
+ #include "chrome/browser/app_controller_mac.h"
+ #endif
+@@ -672,6 +675,15 @@ void SessionServiceBase::BuildCommandsForTab(
+         sessions::CreatePinnedStateCommand(session_id, true));
+   }
+ 
++  // Sticky tabs: tab extra_data is not otherwise carried across rebuilds.
++  std::map<std::string, std::string> sticky_data;
++  tabs::StickyTabController::PopulateExtraData(
++      tabs::TabInterface::MaybeGetFromContents(tab), &sticky_data);
++  for (const auto& [key, value] : sticky_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++  }
++
+   // Record the association between the sessionStorage namespace and the tab.
+   content::SessionStorageNamespaceHandle* session_storage_namespace =
+       tab->GetController().GetDefaultSessionStorageNamespace();
+diff --git a/chrome/browser/ui/browser_commands.cc b/chrome/browser/ui/browser_commands.cc
+index f4d3a23454..66be7177b7 100644
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -116,6 +116,7 @@
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/split_tab_util.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -1186,6 +1187,16 @@ bool CanReload(const BrowserWindowInterface* browser) {
+ void Home(BrowserWindowInterface* browser, WindowOpenDisposition disposition) {
+   base::RecordAction(UserMetricsAction("Home"));
+ 
++  // Sticky tabs: Home sends the active sticky tab back to its sticky URL.
++  if (disposition == WindowOpenDisposition::CURRENT_TAB) {
++    if (auto* sticky = tabs::StickyTabController::From(
++            browser->GetTabStripModel()->GetActiveTab());
++        sticky && sticky->is_sticky()) {
++      sticky->ResetToHome();
++      return;
++    }
++  }
++
+   std::string extra_headers;
+ #if BUILDFLAG(ENABLE_RLZ)
+   // If the home page is a Google home page, add the RLZ header to the request.
+diff --git a/chrome/browser/ui/browser_live_tab_context.cc b/chrome/browser/ui/browser_live_tab_context.cc
+index d48ee3c659..f0e063bf43 100644
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -41,6 +41,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -200,6 +201,8 @@ std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
+ 
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
++  tabs::StickyTabController::PopulateExtraData(
++      tab_strip_model_->GetTabAtIndex(index), &extra_data);
+ 
+   return extra_data;
+ }
+diff --git a/chrome/browser/ui/browser_tabrestore.cc b/chrome/browser/ui/browser_tabrestore.cc
+index 6aca93a450..59be78266d 100644
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/common/buildflags.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+@@ -83,6 +84,7 @@ std::unique_ptr<WebContents> CreateRestoredTab(
+                                extension_app_id);
+ 
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
++  tabs::StickyTabController::StashExtraData(web_contents.get(), extra_data);
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
+ 
+diff --git a/chrome/browser/ui/startup/startup_browser_creator_impl.cc b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+index c19d4ba646..354e64db64 100644
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -50,6 +50,7 @@
+ #include "chrome/browser/ui/startup/startup_tab_provider.h"
+ #include "chrome/browser/ui/startup/startup_types.h"
+ #include "chrome/browser/ui/tabs/shared_tab_group_version_upgrade_modal.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/toasts/api/toast_id.h"
+@@ -65,6 +66,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/signin/public/base/signin_switches.h"
+ #include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/child_process_security_policy.h"
+ #include "content/public/browser/dom_storage_context.h"
+ #include "content/public/browser/storage_partition.h"
+@@ -456,6 +458,16 @@ BrowserWindowInterface* StartupBrowserCreatorImpl::OpenTabsInBrowser(
+ 
+     Navigate(&params);
+     first_tab = false;
++
++    // Sticky pinned tab restored from the pinned_tabs pref (session not
++    // restored): reapply the custom title; home URL is the tab URL.
++    if (!tab.sticky_title.empty() && params.navigated_or_inserted_contents) {
++      if (auto* sticky = tabs::StickyTabController::From(
++              tabs::TabInterface::GetFromContents(
++                  params.navigated_or_inserted_contents))) {
++        sticky->RestoreState(tab.url, tab.sticky_title);
++      }
++    }
+   }
+   if (!browser->GetTabStripModel()->GetActiveWebContents() &&
+       !process_headless_commands) {
+diff --git a/chrome/browser/ui/startup/startup_tab.h b/chrome/browser/ui/startup/startup_tab.h
+index 494d35877b..cc19c7fb44 100644
+--- a/chrome/browser/ui/startup/startup_tab.h
++++ b/chrome/browser/ui/startup/startup_tab.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_STARTUP_STARTUP_TAB_H_
+ #define CHROME_BROWSER_UI_STARTUP_STARTUP_TAB_H_
+ 
++#include <string>
+ #include <vector>
+ 
+ #include "url/gurl.h"
+@@ -31,6 +32,9 @@ struct StartupTab {
+   // True if this tab was launched from an untrusted external custom protocol
+   // (e.g., google-chrome://) that was stripped on startup.
+   bool is_untrusted_launch = false;
++
++  // Sticky pinned tab: custom title restored from the pinned_tabs pref.
++  std::u16string sticky_title;
+ };
+ 
+ using StartupTabs = std::vector<StartupTab>;
+diff --git a/chrome/browser/ui/tabs/BUILD.gn b/chrome/browser/ui/tabs/BUILD.gn
+index fa77a93937..2e4cdd1762 100644
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -438,6 +438,7 @@ if (!is_android) {
+       "split_tab_metrics.h",
+       "split_tab_util.h",
+       "split_view_iph_controller.h",
++      "sticky_tab_controller.h",
+       "tab_attachment_tracker.h",
+       "tab_creation_metrics_controller.h",
+       "tab_data.h",
+@@ -512,6 +513,7 @@ if (!is_android) {
+       "split_tab_metrics.cc",
+       "split_tab_util.cc",
+       "split_view_iph_controller.cc",
++      "sticky_tab_controller.cc",
+       "tab_attachment_tracker.cc",
+       "tab_creation_metrics_controller.cc",
+       "tab_data.cc",
+diff --git a/chrome/browser/ui/tabs/pinned_tab_codec.cc b/chrome/browser/ui/tabs/pinned_tab_codec.cc
+index cc444160cb..bff750e34e 100644
+--- a/chrome/browser/ui/tabs/pinned_tab_codec.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_codec.cc
+@@ -8,10 +8,12 @@
+ 
+ #include <utility>
+ 
++#include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+@@ -27,11 +29,16 @@ namespace {
+ 
+ // Key used in dictionaries for the url.
+ const char kURL[] = "url";
++// Sticky pinned tabs: custom title (home URL is stored as `url`).
++const char kStickyTitle[] = "sticky_title";
+ 
+ // Returns a base::DictValue representing the supplied StartupTab.
+-base::DictValue EncodeTab(const GURL& url) {
++base::DictValue EncodeTab(const GURL& url, const std::u16string& sticky_title) {
+   base::DictValue dict;
+   dict.Set(kURL, url.spec());
++  if (!sticky_title.empty()) {
++    dict.Set(kStickyTitle, base::UTF16ToUTF8(sticky_title));
++  }
+   return dict;
+ }
+ 
+@@ -44,11 +51,18 @@ void EncodePinnedTabs(BrowserWindowInterface* browser,
+       break;
+     }
+ 
++    const tabs::StickyTabController* sticky =
++        tabs::StickyTabController::From(tab);
++    if (sticky && sticky->is_sticky() && sticky->home_url().is_valid()) {
++      serialized_tabs.Append(EncodeTab(sticky->home_url(), sticky->title()));
++      continue;
++    }
++
+     content::WebContents* web_contents = tab->GetContents();
+     NavigationEntry* entry =
+         web_contents->GetController().GetLastCommittedEntry();
+     if (entry) {
+-      serialized_tabs.Append(EncodeTab(entry->GetURL()));
++      serialized_tabs.Append(EncodeTab(entry->GetURL(), std::u16string()));
+     }
+   }
+ }
+@@ -57,9 +71,15 @@ void EncodePinnedTabs(BrowserWindowInterface* browser,
+ // on success.
+ std::optional<StartupTab> DecodeTab(const base::DictValue& value) {
+   const std::string* const url_string = value.FindString(kURL);
+-  return url_string ? std::make_optional(StartupTab(GURL(*url_string),
+-                                                    StartupTab::Type::kPinned))
+-                    : std::nullopt;
++  // Skip empty/invalid entries: opening them at startup DCHECKs.
++  if (!url_string || !GURL(*url_string).is_valid()) {
++    return std::nullopt;
++  }
++  StartupTab tab(GURL(*url_string), StartupTab::Type::kPinned);
++  if (const std::string* title = value.FindString(kStickyTitle)) {
++    tab.sticky_title = base::UTF8ToUTF16(*title);
++  }
++  return tab;
+ }
+ 
+ }  // namespace
+@@ -101,7 +121,7 @@ void PinnedTabCodec::WritePinnedTabs(Profile* profile,
+   base::ListValue& values = update.Get();
+   values.clear();
+   for (const auto& tab : tabs) {
+-    values.Append(EncodeTab(tab.url));
++    values.Append(EncodeTab(tab.url, tab.sticky_title));
+   }
+ }
+ 
+diff --git a/chrome/browser/ui/tabs/public/tab_features.h b/chrome/browser/ui/tabs/public/tab_features.h
+index bd11e5c287..d7702b585b 100644
+--- a/chrome/browser/ui/tabs/public/tab_features.h
++++ b/chrome/browser/ui/tabs/public/tab_features.h
+@@ -315,6 +315,7 @@ class ContextHighlightTabFeature;
+ class InactiveWindowMouseEventController;
+ class PageContextEligibilityHelper;
+ class TabAlertController;
++class StickyTabController;
+ class TabAttachmentTracker;
+ class TabCreationMetricsController;
+ class TabDialogManager;
+@@ -835,6 +836,7 @@ class TabFeatures {
+       filter_navigation_observer_;
+ 
+   std::unique_ptr<TabAttachmentTracker> tab_attachment_tracker_;
++  std::unique_ptr<StickyTabController> sticky_tab_controller_;
+ 
+   // Prefetches zero-prefix suggestions on opening or switching to an NTP.
+   std::unique_ptr<ZeroSuggestPrefetchTabHelper>
+diff --git a/chrome/browser/ui/tabs/sticky_tab_controller.cc b/chrome/browser/ui/tabs/sticky_tab_controller.cc
+new file mode 100644
+index 0000000000..d5aed3f49b
+--- /dev/null
++++ b/chrome/browser/ui/tabs/sticky_tab_controller.cc
+@@ -0,0 +1,312 @@
++// Copyright 2026 The ungoogled-chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
++
++#include "base/functional/bind.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/ui/dialogs/browser_dialogs.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/invalidate_type.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/page_transition_types.h"
++
++namespace tabs {
++
++namespace {
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kStickyTitleFieldId);
++
++constexpr char kHomeUrlKey[] = "sticky.home_url";
++constexpr char kTitleKey[] = "sticky.title";
++constexpr char kRestoreDataKey[] = "sticky_tab_restore_data";
++
++// Restored state parked on the WebContents until the tab is created.
++struct RestoreData : base::SupportsUserData::Data {
++  GURL home_url;
++  std::u16string title;
++};
++
++TabStripModel* GetModel(TabInterface& tab) {
++  BrowserWindowInterface* window = tab.GetBrowserWindowInterface();
++  return window ? window->GetTabStripModel() : nullptr;
++}
++
++}  // namespace
++
++// static
++StickyTabController* StickyTabController::From(TabInterface* tab) {
++  return tab ? Get(tab->GetUnownedUserDataHost()) : nullptr;
++}
++
++// static
++const StickyTabController* StickyTabController::From(const TabInterface* tab) {
++  return tab ? Get(tab->GetUnownedUserDataHost()) : nullptr;
++}
++
++// static
++void StickyTabController::PopulateExtraData(
++    const TabInterface* tab,
++    std::map<std::string, std::string>* extra_data) {
++  const StickyTabController* sticky = From(tab);
++  if (!sticky || !sticky->is_sticky()) {
++    return;
++  }
++  (*extra_data)[kHomeUrlKey] = sticky->home_url_.spec();
++  (*extra_data)[kTitleKey] = base::UTF16ToUTF8(sticky->title_);
++}
++
++// static
++void StickyTabController::StashExtraData(
++    content::WebContents* contents,
++    const std::map<std::string, std::string>& extra_data) {
++  auto home = extra_data.find(kHomeUrlKey);
++  if (home == extra_data.end() || !GURL(home->second).is_valid()) {
++    return;
++  }
++  auto data = std::make_unique<RestoreData>();
++  data->home_url = GURL(home->second);
++  if (auto title = extra_data.find(kTitleKey); title != extra_data.end()) {
++    data->title = base::UTF8ToUTF16(title->second);
++  }
++  contents->SetUserData(kRestoreDataKey, std::move(data));
++}
++
++// static
++int StickyTabController::IndexOfFirstNonStickyTab(const TabStripModel& model) {
++  int index = model.IndexOfFirstNonPinnedTab();
++  for (; index < model.count(); ++index) {
++    StickyTabController* sticky = From(model.GetTabAtIndex(index));
++    if (!sticky || !sticky->is_sticky()) {
++      break;
++    }
++  }
++  return index;
++}
++
++StickyTabController::StickyTabController(TabInterface* tab)
++    : ContentsObservingTabFeature(*tab),
++      scoped_data_holder_(tab->GetUnownedUserDataHost(), *this) {
++  pinned_subscription_ = tab->RegisterPinnedStateChanged(base::BindRepeating(
++      &StickyTabController::OnPinnedStateChanged, base::Unretained(this)));
++  content::WebContents* contents = tab->GetContents();
++  if (auto* data = static_cast<RestoreData*>(
++          contents->GetUserData(kRestoreDataKey))) {
++    sticky_ = true;
++    home_url_ = data->home_url;
++    title_ = data->title;
++    contents->RemoveUserData(kRestoreDataKey);
++  }
++}
++
++StickyTabController::~StickyTabController() = default;
++
++void StickyTabController::MakeSticky() {
++  if (sticky_) {
++    return;
++  }
++  content::WebContents* contents = tab().GetContents();
++  // Unloaded tabs (lazy restore, pending first navigation) have no committed
++  // URL yet. Never store an empty home URL; pinned tabs retry on first load.
++  GURL home_url = contents->GetLastCommittedURL();
++  if (!home_url.is_valid()) {
++    home_url = contents->GetVisibleURL();
++  }
++  if (!home_url.is_valid()) {
++    return;
++  }
++  TabStripModel* model = GetModel(tab());
++  // Pinned tabs already live at the front. Split tabs must stay adjacent to
++  // their partner, so they are not moved.
++  // ponytail: split tabs become sticky in place; move the split if needed.
++  if (model && !tab().IsPinned() && !tab().GetSplit()) {
++    if (tab().GetGroup()) {
++      model->RemoveFromGroup({model->GetIndexOfTab(&tab())});
++    }
++    // Computed before `sticky_` is set, so this tab is not part of the run.
++    const int target = IndexOfFirstNonStickyTab(*model);
++    model->MoveWebContentsAt(model->GetIndexOfTab(&tab()), target,
++                             /*select_after_move=*/false);
++  }
++  sticky_ = true;
++  home_url_ = home_url;
++  title_ = contents->GetTitle();
++  left_home_ = false;
++  NotifyChanged();
++  Persist();
++}
++
++void StickyTabController::RemoveSticky() {
++  sticky_ = false;
++  left_home_ = false;
++  prune_history_on_commit_ = false;
++  title_.clear();
++  home_url_ = GURL();
++  NotifyChanged();
++  Persist();
++}
++
++void StickyTabController::ResetToHome() {
++  if (!sticky_ || !home_url_.is_valid()) {
++    return;
++  }
++  prune_history_on_commit_ = true;
++  content::NavigationController::LoadURLParams params(home_url_);
++  params.transition_type = ui::PAGE_TRANSITION_AUTO_BOOKMARK;
++  tab().GetContents()->GetController().LoadURLWithParams(params);
++}
++
++void StickyTabController::SetHomeToCurrent() {
++  if (!sticky_) {
++    MakeSticky();
++    return;
++  }
++  const GURL url = tab().GetContents()->GetLastCommittedURL();
++  if (!url.is_valid()) {
++    return;
++  }
++  home_url_ = url;
++  left_home_ = false;
++  NotifyChanged();
++  Persist();
++}
++
++void StickyTabController::SetTitle(const std::u16string& title) {
++  if (!sticky_) {
++    return;
++  }
++  title_ = title;
++  NotifyChanged();
++  Persist();
++}
++
++void StickyTabController::ShowRenameDialog() {
++  BrowserWindowInterface* window = tab().GetBrowserWindowInterface();
++  if (!window) {
++    return;
++  }
++  if (!sticky_) {
++    MakeSticky();  // Pinned tab not loaded yet: lazy sticky state.
++    if (!sticky_) {
++      return;  // No URL yet.
++    }
++  }
++  // ponytail: hardcoded English strings, see tab_menu_model.cc.
++  ui::DialogModel::Builder builder;
++  ui::DialogModel* model = builder.model();
++  builder.SetTitle(u"Rename tab")
++      .AddTextfield(kStickyTitleFieldId, std::u16string(),
++                    title_.empty() ? tab().GetContents()->GetTitle() : title_,
++                    ui::DialogModelTextfield::Params().SetAccessibleName(
++                        u"Tab name"))
++      .SetInitiallyFocusedField(kStickyTitleFieldId)
++      .AddOkButton(base::BindOnce(
++          [](base::WeakPtr<StickyTabController> self,
++             ui::DialogModel* model) {
++            if (self) {
++              self->SetTitle(
++                  model->GetTextfieldByUniqueId(kStickyTitleFieldId)->text());
++            }
++          },
++          weak_factory_.GetWeakPtr(), model))
++      .AddCancelButton(base::DoNothing());
++  chrome::ShowBrowserModal(window, builder.Build());
++}
++
++void StickyTabController::RestoreState(const GURL& home_url,
++                                       const std::u16string& title) {
++  sticky_ = true;
++  home_url_ = home_url;
++  title_ = title;
++  left_home_ = false;
++  NotifyChanged();
++  Persist();
++}
++
++void StickyTabController::DidFinishNavigation(
++    content::NavigationHandle* navigation) {
++  if (!navigation->IsInPrimaryMainFrame() || !navigation->HasCommitted()) {
++    return;
++  }
++  if (!sticky_) {
++    // Pinned tabs are always sticky. Tabs inserted already pinned (startup,
++    // restore without saved state) become sticky on first load; the title
++    // stays empty so the page title is shown until the user renames it.
++    if (tab().IsPinned() && !navigation->IsSameDocument()) {
++      MakeSticky();
++      title_.clear();
++      Persist();
++    }
++    return;
++  }
++  if (prune_history_on_commit_ && !navigation->IsSameDocument()) {
++    prune_history_on_commit_ = false;
++    content::NavigationController& controller =
++        web_contents()->GetController();
++    if (controller.CanPruneAllButLastCommitted()) {
++      controller.PruneAllButLastCommitted();
++    }
++  }
++  // Exact match, `#fragment` included (fires for same-document changes too).
++  SetLeftHome(navigation->GetURL() != home_url_);
++}
++
++void StickyTabController::OnPinnedStateChanged(TabInterface* tab,
++                                               bool pinned) {
++  // Pinned tabs are always sticky. Unpinning keeps the tab sticky (now with a
++  // visible title); the user can remove it from the menu.
++  if (pinned) {
++    MakeSticky();
++  }
++}
++
++void StickyTabController::SetLeftHome(bool left_home) {
++  if (left_home_ == left_home) {
++    return;
++  }
++  left_home_ = left_home;
++  NotifyChanged();
++}
++
++void StickyTabController::NotifyChanged() {
++  // Tab views read TabData via TabDataObserver, which only refreshes on
++  // TabUIHelper changes. A title invalidation takes the same path as a page
++  // title change (Browser -> BrowserUiController -> NotifyTabUIChanged).
++  tab().GetContents()->NotifyNavigationStateChanged(
++      content::INVALIDATE_TYPE_TITLE);
++}
++
++void StickyTabController::Persist() {
++  BrowserWindowInterface* window = tab().GetBrowserWindowInterface();
++  if (!window) {
++    return;
++  }
++  if (SessionService* session =
++          SessionServiceFactory::GetForProfileIfExisting(window->GetProfile())) {
++    // Empty values clear the state (see StashExtraData).
++    const SessionID tab_id =
++        sessions::SessionTabHelper::IdForTab(tab().GetContents());
++    session->AddTabExtraData(window->GetSessionID(), tab_id, kHomeUrlKey,
++                             sticky_ ? home_url_.spec() : std::string());
++    session->AddTabExtraData(window->GetSessionID(), tab_id, kTitleKey,
++                             base::UTF16ToUTF8(title_));
++  }
++  if (tab().IsPinned()) {
++    PinnedTabCodec::WritePinnedTabs(window->GetProfile());
++  }
++}
++
++DEFINE_USER_DATA(StickyTabController);
++
++}  // namespace tabs
+diff --git a/chrome/browser/ui/tabs/sticky_tab_controller.h b/chrome/browser/ui/tabs/sticky_tab_controller.h
+new file mode 100644
+index 0000000000..ca529bea2b
+--- /dev/null
++++ b/chrome/browser/ui/tabs/sticky_tab_controller.h
+@@ -0,0 +1,94 @@
++// Copyright 2026 The ungoogled-chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_STICKY_TAB_CONTROLLER_H_
++#define CHROME_BROWSER_UI_TABS_STICKY_TAB_CONTROLLER_H_
++
++#include <map>
++#include <string>
++
++#include "base/callback_list.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/ui/tabs/contents_observing_tab_feature.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++#include "url/gurl.h"
++
++class TabStripModel;
++
++namespace content {
++class NavigationHandle;
++class WebContents;
++}
++
++namespace tabs {
++
++class TabInterface;
++
++// Sticky tab: remembers a home URL and a custom title. Pinned tabs are always
++// sticky. See ungoogled-chromium/docs/sticky-tabs.md.
++class StickyTabController : public ContentsObservingTabFeature {
++ public:
++  DECLARE_USER_DATA(StickyTabController);
++
++  static StickyTabController* From(TabInterface* tab);
++  static const StickyTabController* From(const TabInterface* tab);
++
++  // First index after pinned tabs and the run of sticky tabs following them.
++  static int IndexOfFirstNonStickyTab(const TabStripModel& model);
++
++  // Session persistence via the tab's session `extra_data`.
++  static void PopulateExtraData(const TabInterface* tab,
++                                std::map<std::string, std::string>* extra_data);
++  // Called on restore before the tab exists; picked up by the constructor.
++  static void StashExtraData(
++      content::WebContents* contents,
++      const std::map<std::string, std::string>& extra_data);
++
++  explicit StickyTabController(TabInterface* tab);
++  StickyTabController(const StickyTabController&) = delete;
++  StickyTabController& operator=(const StickyTabController&) = delete;
++  ~StickyTabController() override;
++
++  bool is_sticky() const { return sticky_; }
++  bool has_left_home() const { return left_home_; }
++  const std::u16string& title() const { return title_; }
++  const GURL& home_url() const { return home_url_; }
++
++  // Stores current URL + title as home state. Unpinned tabs leave their group
++  // and move right after the pinned + sticky tabs.
++  void MakeSticky();
++  void RemoveSticky();
++  // Loads home URL and drops back/forward history.
++  void ResetToHome();
++  void SetHomeToCurrent();
++  void SetTitle(const std::u16string& title);
++  // Modal dialog with a text field; empty name falls back to the page title.
++  void ShowRenameDialog();
++  // Applies saved state without moving the tab (restore, startup).
++  void RestoreState(const GURL& home_url, const std::u16string& title);
++
++ private:
++  // content::WebContentsObserver:
++  void DidFinishNavigation(content::NavigationHandle* navigation) override;
++
++  void OnPinnedStateChanged(TabInterface* tab, bool pinned);
++  void SetLeftHome(bool left_home);
++  // Redraws the tab (title, attention dot) and refreshes menu state.
++  void NotifyChanged();
++  // Writes state to the session and, for pinned tabs, the pinned_tabs pref.
++  void Persist();
++
++  bool sticky_ = false;
++  bool left_home_ = false;
++  bool prune_history_on_commit_ = false;
++  std::u16string title_;
++  GURL home_url_;
++  base::CallbackListSubscription pinned_subscription_;
++  ui::ScopedUnownedUserData<StickyTabController> scoped_data_holder_;
++  base::WeakPtrFactory<StickyTabController> weak_factory_{this};
++};
++
++}  // namespace tabs
++
++#endif  // CHROME_BROWSER_UI_TABS_STICKY_TAB_CONTROLLER_H_
+diff --git a/chrome/browser/ui/tabs/tab_data.cc b/chrome/browser/ui/tabs/tab_data.cc
+index 9c35790b19..41f4ccaffb 100644
+--- a/chrome/browser/ui/tabs/tab_data.cc
++++ b/chrome/browser/ui/tabs/tab_data.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/collaboration_messaging_tab_data.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_image.h"
+ #include "chrome/browser/ui/thumbnails/thumbnail_tab_helper.h"
+@@ -57,6 +58,17 @@ TabData TabData::FromTabInterface(tabs::TabInterface* tab_interface) {
+   tab_data.pinned = tab_interface->IsPinned();
+   tab_data.blocked = tab_interface->IsBlocked();
+ 
++  // Sticky tabs: fixed title and favicon dot state.
++  if (StickyTabController* sticky = StickyTabController::From(tab_interface);
++      sticky && sticky->is_sticky()) {
++    if (!sticky->title().empty()) {
++      tab_data.title = sticky->title();
++    }
++    tab_data.sticky_state = sticky->has_left_home()
++                                ? TabData::StickyState::kLeftHome
++                                : TabData::StickyState::kHome;
++  }
++
+   ThumbnailTabHelper* const thumbnail_tab_helper =
+       ThumbnailTabHelper::From(tab_interface);
+   tab_data.thumbnail =
+@@ -99,7 +111,8 @@ bool TabData::operator==(const TabData& other) const {
+          is_tab_discarded == other.is_tab_discarded &&
+          last_committed_url == other.last_committed_url &&
+          alert_state == other.alert_state && pinned == other.pinned &&
+-         blocked == other.blocked && thumbnail == other.thumbnail &&
++         blocked == other.blocked && sticky_state == other.sticky_state &&
++         thumbnail == other.thumbnail &&
+          tab_resource_usage == other.tab_resource_usage;
+ }
+ 
+diff --git a/chrome/browser/ui/tabs/tab_data.h b/chrome/browser/ui/tabs/tab_data.h
+index 13cf9c48d2..7c5a58d141 100644
+--- a/chrome/browser/ui/tabs/tab_data.h
++++ b/chrome/browser/ui/tabs/tab_data.h
+@@ -69,6 +69,11 @@ struct TabData {
+   bool pinned = false;
+   bool blocked = false;
+ 
++  // Sticky tabs (sticky_tab_controller.h): favicon dot, green at home URL,
++  // yellow once the tab has left it.
++  enum class StickyState { kNone, kHome, kLeftHome };
++  StickyState sticky_state = StickyState::kNone;
++
+   scoped_refptr<ThumbnailImage> thumbnail;
+   scoped_refptr<const TabResourceUsage> tab_resource_usage;
+   base::WeakPtr<tab_groups::CollaborationMessagingTabData>
+diff --git a/chrome/browser/ui/tabs/tab_features.cc b/chrome/browser/ui/tabs/tab_features.cc
+index b29a8540e5..15099e5e91 100644
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -183,6 +183,7 @@
+ #include "chrome/browser/skills/skills_update_observer.h"
+ #include "chrome/browser/ui/contextual_search/tab_contextualization_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_attachment_tracker.h"
+ #include "chrome/browser/v8_compile_hints/v8_compile_hints_tab_helper.h"
+ #include "chrome/browser/web_applications/isolated_web_apps/window_management/window_management_content_setting_observer.h"
+@@ -660,6 +661,9 @@ void TabFeatures::Init(TabInterface& tab, Profile* profile) {
+ 
+   tab_ui_helper_ = GetUserDataFactory().CreateInstance<TabUIHelper>(tab, tab);
+ 
++  sticky_tab_controller_ =
++      GetUserDataFactory().CreateInstance<StickyTabController>(tab, &tab);
++
+   task_manager::WebContentsTags::CreateForTabContents(tab.GetContents());
+ 
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_LINUX)
+diff --git a/chrome/browser/ui/tabs/tab_menu_model.cc b/chrome/browser/ui/tabs/tab_menu_model.cc
+index 17ab4e685b..e8023517b4 100644
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/ui/tabs/split_view_layout_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_utils.h"
+@@ -525,6 +526,24 @@ void TabMenuModel::Build(int index) {
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
+   }
+ 
++  // Sticky tabs, see ungoogled-chromium/docs/sticky-tabs.md.
++  // ponytail: hardcoded English labels, avoids regenerating
++  // generated_resources.h (thousands of dependents). Move to .grd if localized.
++  if (auto* sticky =
++          tabs::StickyTabController::From(tab_strip_->GetTabAtIndex(index))) {
++    const bool pinned = tab_strip_->IsTabPinned(index);
++    if (!pinned) {
++      AddItem(TabStripModel::CommandToggleSticky,
++              sticky->is_sticky() ? u"Remove sticky" : u"Make tab sticky");
++    }
++    if (pinned || sticky->is_sticky()) {
++      AddItem(TabStripModel::CommandStickyReset, u"Back to sticky URL");
++      AddItem(TabStripModel::CommandStickySetHome,
++              u"Set current page as sticky URL");
++      AddItem(TabStripModel::CommandStickyRename, u"Rename\u2026");
++    }
++  }
++
+   const bool will_mute = !AreAllSitesMuted(*tab_strip_, indices);
+   AddItem(TabStripModel::CommandToggleSiteMuted,
+           will_mute ? l10n_util::GetPluralStringFUTF16(
+diff --git a/chrome/browser/ui/tabs/tab_strip_model.cc b/chrome/browser/ui/tabs/tab_strip_model.cc
+index f2f3415e6f..c4bbdac1cf 100644
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -66,6 +66,7 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_muted_utils.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+@@ -2782,6 +2783,15 @@ bool TabStripModel::IsContextMenuCommandEnabled(
+ 
+     case CommandToggleVertical:
+       return true;
++
++    case CommandToggleSticky:
++    case CommandStickySetHome:
++    case CommandStickyRename:
++      return true;
++    case CommandStickyReset: {
++      auto* sticky = tabs::StickyTabController::From(GetTabAtIndex(context_index));
++      return sticky && sticky->has_left_home();
++    }
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+   NOTREACHED() << "Unsupported command: " << command_id;
+@@ -3206,6 +3216,25 @@ void TabStripModel::ExecuteContextMenuCommand(int context_index,
+           IDC_TOGGLE_VERTICAL_TABS);
+       break;
+     }
++    case CommandToggleSticky:
++    case CommandStickyReset:
++    case CommandStickySetHome:
++    case CommandStickyRename: {
++      auto* sticky = tabs::StickyTabController::From(GetTabAtIndex(context_index));
++      if (!sticky) {
++        break;
++      }
++      if (command_id == CommandToggleSticky) {
++        sticky->is_sticky() ? sticky->RemoveSticky() : sticky->MakeSticky();
++      } else if (command_id == CommandStickyReset) {
++        sticky->ResetToHome();
++      } else if (command_id == CommandStickySetHome) {
++        sticky->SetHomeToCurrent();
++      } else if (command_id == CommandStickyRename) {
++        sticky->ShowRenameDialog();
++      }
++      break;
++    }
+     case CommandAddToNewGroupFromMenuItem: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.AddToNewGroupFromMenuItem.SelectedTabsCount",
+@@ -3720,8 +3749,14 @@ bool TabStripModel::ShouldRunUnloadListenerBeforeClosing(
+ }
+ 
+ int TabStripModel::ConstrainInsertionIndex(int index, bool pinned_tab) const {
+-  return pinned_tab ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
+-                    : std::clamp(index, IndexOfFirstNonPinnedTab(), count());
++  // Sticky tabs: new unpinned tabs never land before or inside the run of
++  // sticky tabs after the pinned ones. Moves (drags) stay unconstrained.
++  return pinned_tab
++             ? std::clamp(index, 0, IndexOfFirstNonPinnedTab())
++             : std::clamp(
++                   index,
++                   tabs::StickyTabController::IndexOfFirstNonStickyTab(*this),
++                   count());
+ }
+ 
+ int TabStripModel::ConstrainMoveIndex(int index, bool pinned_tab) const {
+diff --git a/chrome/browser/ui/views/tabs/common/tab_view.cc b/chrome/browser/ui/views/tabs/common/tab_view.cc
+index 5292c13b13..daed32f5fd 100644
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -13,6 +13,7 @@
+ #include "base/metrics/user_metrics_action.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/dictation/dictation_keyed_service.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_controller.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+@@ -625,6 +626,16 @@ bool TabView::OnKeyReleased(const ui::KeyEvent& event) {
+ }
+ 
+ bool TabView::OnMousePressed(const ui::MouseEvent& event) {
++  // Sticky tabs: double-click on a titled sticky tab renames it.
++  if (event.IsOnlyLeftMouseButton() && event.GetClickCount() == 2) {
++    // TabView only exposes a const TabInterface; the tab itself is mutable.
++    auto* tab = const_cast<tabs::TabInterface*>(GetTabInterface());
++    auto* sticky = tabs::StickyTabController::From(tab);
++    if (sticky && sticky->is_sticky() && !tab->IsPinned()) {
++      sticky->ShowRenameDialog();
++      return true;
++    }
++  }
+   CHECK(collection_node_);
+ 
+   auto* controller = collection_node_->GetController();
+diff --git a/chrome/browser/ui/views/tabs/tab.cc b/chrome/browser/ui/views/tabs/tab.cc
+index da743f2d79..eeb0e6f76e 100644
+--- a/chrome/browser/ui/views/tabs/tab.cc
++++ b/chrome/browser/ui/views/tabs/tab.cc
+@@ -22,6 +22,7 @@
+ #include "build/build_config.h"
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/dictation/dictation_keyed_service.h"
++#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_controller.h"
+ #include "chrome/browser/glic/browser_ui/tab_underline_view.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+@@ -728,6 +729,14 @@ bool IsSelectionModifierDown(const ui::MouseEvent& event) {
+ }  // namespace
+ 
+ bool Tab::OnMousePressed(const ui::MouseEvent& event) {
++  // Sticky tabs: double-click on a titled sticky tab renames it.
++  if (event.IsOnlyLeftMouseButton() && event.GetClickCount() == 2) {
++    auto* sticky = tabs::StickyTabController::From(tab_handle().Get());
++    if (sticky && sticky->is_sticky() && !data().pinned) {
++      sticky->ShowRenameDialog();
++      return true;
++    }
++  }
+   shift_pressed_on_mouse_down_ = event.IsShiftDown();
+   controller_->UpdateHoverCard(nullptr,
+                                TabSlotController::HoverCardUpdateType::kEvent);
+diff --git a/chrome/browser/ui/views/tabs/tab/tab_icon.cc b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
+index dca6d70923..7d58c26cff 100644
+--- a/chrome/browser/ui/views/tabs/tab/tab_icon.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_icon.cc
+@@ -129,6 +129,17 @@ void TabIcon::SetData(const tabs::TabData& data) {
+   SetDiscarded(data.should_show_discard_status);
+   has_tab_data_ = true;
+ 
++  std::optional<ui::ColorId> sticky_dot_color;
++  if (data.sticky_state == tabs::TabData::StickyState::kHome) {
++    sticky_dot_color = ui::kColorAlertLowSeverity;
++  } else if (data.sticky_state == tabs::TabData::StickyState::kLeftHome) {
++    sticky_dot_color = ui::kColorAlertMediumSeverityIcon;
++  }
++  if (sticky_dot_color_ != sticky_dot_color) {
++    sticky_dot_color_ = sticky_dot_color;
++    SchedulePaint();
++  }
++
+   UpdateThrobber();
+ 
+   const bool showing_load = GetShowingLoadingAnimation();
+@@ -239,7 +250,8 @@ void TabIcon::OnPaint(gfx::Canvas* canvas) {
+       std::min(gfx::kFaviconSize, contents_bounds.height()));
+ 
+   // Don't paint the attention indicator during the loading animation.
+-  if (!GetShowingLoadingAnimation() && GetShowingAttentionIndicator() &&
++  if (!GetShowingLoadingAnimation() &&
++      (GetShowingAttentionIndicator() || sticky_dot_color_) &&
+       !should_display_crashed_favicon_) {
+     PaintAttentionIndicatorAndIcon(canvas, GetIconToPaint(), icon_bounds);
+   } else if (was_discard_indicator_shown_) {
+@@ -305,7 +317,11 @@ void TabIcon::PaintAttentionIndicatorAndIcon(gfx::Canvas* canvas,
+ 
+   // Draws the actual attention indicator.
+   cc::PaintFlags indicator_flags;
+-  indicator_flags.setColor(views::GetCascadingAccentColor(this));
++  // Real attention keeps the accent color; otherwise the sticky tab dot.
++  indicator_flags.setColor(
++      GetShowingAttentionIndicator() || !sticky_dot_color_
++          ? views::GetCascadingAccentColor(this)
++          : GetColorProvider()->GetColor(*sticky_dot_color_));
+   indicator_flags.setAntiAlias(true);
+   canvas->DrawCircle(circle_center, kAttentionIndicatorRadius, indicator_flags);
+ }
+diff --git a/chrome/browser/ui/views/tabs/tab/tab_icon.h b/chrome/browser/ui/views/tabs/tab/tab_icon.h
+index c4a7652ded..7145473b83 100644
+--- a/chrome/browser/ui/views/tabs/tab/tab_icon.h
++++ b/chrome/browser/ui/views/tabs/tab/tab_icon.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_TAB_TAB_ICON_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_TAB_TAB_ICON_H_
+ 
++#include <optional>
++
+ #include "base/gtest_prod_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/time/time.h"
+@@ -14,6 +16,7 @@
+ #include "ui/base/interaction/element_tracker.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
+ #include "ui/gfx/animation/linear_animation.h"
+ #include "ui/gfx/animation/slide_animation.h"
+ #include "ui/gfx/image/image_skia.h"
+@@ -160,6 +163,8 @@ class TabIcon : public views::View, public views::AnimationDelegateViews {
+   tabs::TabNetworkState network_state_ = tabs::TabNetworkState::kNone;
+   bool crashed_ = false;
+   int attention_types_ = 0;  // Bitmask of AttentionType.
++  // Sticky tab dot color; set from TabData::sticky_state.
++  std::optional<ui::ColorId> sticky_dot_color_;
+ 
+   // Value from last call to SetNetworkState. When true, the network loading
+   // animation will not be shown.
+diff --git a/components/tabs/public/tab_context_menu_command.h b/components/tabs/public/tab_context_menu_command.h
+index 0ed448fdc4..cfa7e86808 100644
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -39,6 +39,10 @@ enum TabContextMenuCommand {
+   CommandGlicSwitchToRecentConversation,
+   CommandGlicUnshare,
+   CommandToggleFocusGroup,
++  CommandToggleSticky,
++  CommandStickyReset,
++  CommandStickySetHome,
++  CommandStickyRename,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
