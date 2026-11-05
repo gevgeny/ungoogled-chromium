@@ -7,7 +7,7 @@ Goal: smallest possible diff against Chromium; reuse existing UI.
 ## Behavior
 
 - Pinned tabs: always sticky, look unchanged (icon only, no title).
-- Other tabs: user makes one sticky → store current URL + title, leave its group, move it right after pinned tabs (after the last sticky tab). Title stays visible.
+- Other tabs: user makes one sticky → store current URL + title, move it right after pinned tabs. A tab in a group stays in the group; the whole group moves (groups with a sticky tab count as part of the sticky run).
 - Leave: committed URL differs from home in any part, `#fragment` included (`GURL` equality in `DidFinishNavigation`, which also fires for same-document/`pushState` changes) → tab marked changed. Sites that rewrite URL on load: user picks "Set current page as sticky URL".
 - Reset: load home URL, drop back/forward history, scroll, session storage.
 
@@ -18,10 +18,10 @@ Goal: smallest possible diff against Chromium; reuse existing UI.
 | Title | Sticky title replaces page title in `TabData` (`tab_data.cc`); works in horizontal/vertical strip, tooltip, hover card. |
 | State dot | Favicon dot via `TabData::sticky_state` → `TabIcon`: green (`kColorAlertLowSeverity`) at home URL, yellow (`kColorAlertMediumSeverityIcon`) after leaving it, none for other tabs. Real attention keeps the accent color. Same for pinned and titled sticky tabs. |
 | Back home | Chrome Home command (toolbar ⌂ when enabled, Cmd+Shift+H, History → Home) resets the active sticky tab instead of opening the homepage; hook in `chrome::Home()`. Also menu "Back to sticky URL". |
-| Rename | Double-click sticky tab, or menu "Rename…" → small bubble with text field (pattern: `tab_group_editor_bubble_view.cc`). Enter saves, Esc cancels. |
+| Rename | Double-click sticky tab, or menu "Rename…" → centered modal (`chrome::ShowBrowserModal`). Enter saves, Esc cancels. |
 | Context menu | "Make tab sticky" / "Remove sticky", "Back to sticky URL" (only when changed), "Set current page as sticky URL", "Rename…". |
 
-Skipped for now: inline title editing, in-tab reset button / favicon click (layout churn → upstream conflicts), edit-URL dialog. Rename is a centered modal (`chrome::ShowBrowserModal`), not a tab-anchored popup.
+Skipped for now: inline title editing, in-tab reset button / favicon click (layout churn → upstream conflicts), edit-URL dialog, tab-anchored rename popup (would require tabs → views cross-layer plumbing).
 
 ## Decisions
 
@@ -36,9 +36,12 @@ Skipped for now: inline title editing, in-tab reset button / favicon click (layo
 
 **Startup:**
 - Session restored → `browser_tabrestore.cc` parks state on the WebContents; the tab's `StickyTabController` picks it up.
-- Session not restored → pinned tabs open from `pinned_tabs` at their home URL with their title. Normal sticky tabs are dropped, same as other normal tabs.
-- Pinned tab without saved state → becomes sticky on first load, title follows page until renamed.
+- Session not restored ("Open the New Tab page") → pinned tabs open from `pinned_tabs` at their home URL with their title. Non-pinned sticky tabs are dropped, same as other normal tabs.
+- Session restore attempted but returned nothing (session file missing or corrupt with "Continue where you left off" on) → `RestoreOrCreateBrowser` falls back to opening the `pinned_tabs` backup, so sticky pinned tabs are not lost.
+- Pinned tab without saved state (legacy, pre-feature pin) → becomes sticky on first load, title follows page until renamed.
 
-**Placement: constrain inserts only.** New tabs that would land before or inside the sticky run open right after it; tabs already landing after it are untouched: `TabStripModel::ConstrainInsertionIndex` lower bound becomes `IndexOfFirstNonStickyTab()` (first non-pinned, non-sticky index). `ConstrainMoveIndex` unchanged — dragging is free. No tab group used for the sticky set.
+**Placement: constrain inserts only.** New tabs that would land before or inside the sticky run open right after it; tabs already landing after it are untouched: `TabStripModel::ConstrainInsertionIndex` lower bound becomes `IndexOfFirstNonStickyTab()` (first non-pinned, non-sticky index; groups with a sticky tab are skipped as a unit). `ConstrainMoveIndex` unchanged — dragging is free. Inserts into an explicit group (link opened from a grouped tab) keep their index so groups stay contiguous.
+
+**Redraw:** sticky state changes trigger `WebContents::NotifyNavigationStateChanged(INVALIDATE_TYPE_TITLE)` — same path as page title changes; refreshes horizontal/vertical tabs, tooltip, hover card.
 
 No backups: Preferences writes are atomic; losing the file means losing the whole profile.

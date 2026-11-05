@@ -1,9 +1,10 @@
 # Sticky tabs: a tab remembers a home URL and a custom title.
 # Pinned tabs are always sticky; any other tab can be made sticky from the tab
-# context menu and moves right after the pinned tabs. Favicon dot shows state
-# (green at home, yellow after leaving). Home command / Cmd+Shift+H and
-# "Back to sticky URL" return to the home URL. State persists in the session
-# and, for pinned tabs, in the pinned_tabs pref.
+# context menu. Tabs in a group stay in the group; the whole group moves to
+# the sticky area. Favicon dot shows state (green at home, yellow after
+# leaving). Home command / Cmd+Shift+H and "Back to sticky URL" return to
+# the home URL. State persists in the session and, for pinned tabs, in the
+# pinned_tabs pref (also used as fallback when session restore fails).
 # See docs/sticky-tabs.md.
 
 diff --git a/chrome/browser/sessions/session_service_base.cc b/chrome/browser/sessions/session_service_base.cc
@@ -107,18 +108,19 @@ index 6aca93a450..59be78266d 100644
        web_contents.get(), extra_data);
  
 diff --git a/chrome/browser/ui/startup/startup_browser_creator_impl.cc b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-index c19d4ba646..354e64db64 100644
+index c19d4ba646..c16fb85be0 100644
 --- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
 +++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
-@@ -50,6 +50,7 @@
+@@ -50,6 +50,8 @@
  #include "chrome/browser/ui/startup/startup_tab_provider.h"
  #include "chrome/browser/ui/startup/startup_types.h"
  #include "chrome/browser/ui/tabs/shared_tab_group_version_upgrade_modal.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
 +#include "chrome/browser/ui/tabs/sticky_tab_controller.h"
  #include "chrome/browser/ui/tabs/tab_enums.h"
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/toasts/api/toast_id.h"
-@@ -65,6 +66,7 @@
+@@ -65,6 +67,7 @@
  #include "components/prefs/pref_service.h"
  #include "components/signin/public/base/signin_switches.h"
  #include "components/tab_groups/tab_group_id.h"
@@ -126,7 +128,7 @@ index c19d4ba646..354e64db64 100644
  #include "content/public/browser/child_process_security_policy.h"
  #include "content/public/browser/dom_storage_context.h"
  #include "content/public/browser/storage_partition.h"
-@@ -456,6 +458,16 @@ BrowserWindowInterface* StartupBrowserCreatorImpl::OpenTabsInBrowser(
+@@ -456,6 +459,16 @@ BrowserWindowInterface* StartupBrowserCreatorImpl::OpenTabsInBrowser(
  
      Navigate(&params);
      first_tab = false;
@@ -143,6 +145,47 @@ index c19d4ba646..354e64db64 100644
    }
    if (!browser->GetTabStripModel()->GetActiveWebContents() &&
        !process_headless_commands) {
+@@ -758,6 +771,9 @@ BrowserWindowInterface* StartupBrowserCreatorImpl::RestoreOrCreateBrowser(
+     if (browser_window) {
+       return browser_window;
+     }
++    // Sticky tabs: session restore returned nothing (missing/corrupt session).
++    // Fall through to normal open, but prepend the pinned_tabs backup so
++    // sticky pinned tabs still come back.
+   } else if (behavior == BrowserOpenBehavior::USE_EXISTING ||
+              behavior ==
+                  BrowserOpenBehavior::USE_EXISTING_AND_OVERWRITE_ACTIVE_TAB) {
+@@ -767,14 +783,26 @@ BrowserWindowInterface* StartupBrowserCreatorImpl::RestoreOrCreateBrowser(
+   base::AutoReset<bool> synchronous_launch_resetter(
+       &StartupBrowserCreator::in_synchronous_profile_launch_, true);
+ 
++  // Sticky tabs: if we expected a session restore but it did not succeed,
++  // open the pinned_tabs backup so sticky pinned tabs are not lost.
++  StartupTabs effective_tabs = tabs;
++  if (behavior == BrowserOpenBehavior::SYNCHRONOUS_RESTORE) {
++    StartupTabs pinned = PinnedTabCodec::ReadPinnedTabs(profile_);
++    if (!pinned.empty()) {
++      pinned.insert(pinned.end(), effective_tabs.begin(),
++                    effective_tabs.end());
++      effective_tabs = std::move(pinned);
++    }
++  }
++
+   // OpenTabsInBrowser requires at least one tab be passed. As a fallback to
+-  // prevent a crash, use the NTP if |tabs| is empty. This could happen if
+-  // we expected a session restore to happen but it did not occur/succeed.
++  // prevent a crash, use the NTP if |effective_tabs| is empty. This could
++  // happen if we expected a session restore to happen but it did not occur.
+   browser = OpenTabsInBrowser(
+       browser, process_startup,
+-      (tabs.empty()
++      (effective_tabs.empty()
+            ? StartupTabs({StartupTab(chrome::ChromeUINewTabURLAsGURL())})
+-           : tabs),
++           : effective_tabs),
+       (behavior == BrowserOpenBehavior::USE_EXISTING_AND_OVERWRITE_ACTIVE_TAB
+            ? (TabOverWrite::kYes)
+            : (TabOverWrite::kNo)));
 diff --git a/chrome/browser/ui/startup/startup_tab.h b/chrome/browser/ui/startup/startup_tab.h
 index 494d35877b..cc19c7fb44 100644
 --- a/chrome/browser/ui/startup/startup_tab.h
@@ -290,10 +333,10 @@ index bd11e5c287..d7702b585b 100644
    std::unique_ptr<ZeroSuggestPrefetchTabHelper>
 diff --git a/chrome/browser/ui/tabs/sticky_tab_controller.cc b/chrome/browser/ui/tabs/sticky_tab_controller.cc
 new file mode 100644
-index 0000000000..d5aed3f49b
+index 0000000000..9ce4f386b0
 --- /dev/null
 +++ b/chrome/browser/ui/tabs/sticky_tab_controller.cc
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,345 @@
 +// Copyright 2026 The ungoogled-chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -307,7 +350,11 @@ index 0000000000..d5aed3f49b
 +#include "chrome/browser/sessions/session_service_factory.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_group.h"
++#include "ui/gfx/range/range.h"
 +#include "components/sessions/content/session_tab_helper.h"
 +#include "components/tabs/public/tab_interface.h"
 +#include "content/public/browser/navigation_controller.h"
@@ -333,6 +380,12 @@ index 0000000000..d5aed3f49b
 +  GURL home_url;
 +  std::u16string title;
 +};
++
++// Index range of `group` in `model`.
++gfx::Range GroupRange(const TabStripModel& model,
++                      const tab_groups::TabGroupId& group) {
++  return model.group_model()->GetTabGroup(group)->ListTabs();
++}
 +
 +TabStripModel* GetModel(TabInterface& tab) {
 +  BrowserWindowInterface* window = tab.GetBrowserWindowInterface();
@@ -381,12 +434,30 @@ index 0000000000..d5aed3f49b
 +
 +// static
 +int StickyTabController::IndexOfFirstNonStickyTab(const TabStripModel& model) {
++  // A tab group with at least one sticky tab counts as sticky as a whole, so
++  // the returned index is always a group boundary.
 +  int index = model.IndexOfFirstNonPinnedTab();
-+  for (; index < model.count(); ++index) {
++  while (index < model.count()) {
++    if (std::optional<tab_groups::TabGroupId> group =
++            model.GetTabGroupForTab(index)) {
++      const gfx::Range range = GroupRange(model, *group);
++      bool has_sticky = false;
++      for (size_t i = range.start(); i < range.end() && !has_sticky; ++i) {
++        const StickyTabController* sticky =
++            From(model.GetTabAtIndex(static_cast<int>(i)));
++        has_sticky = sticky && sticky->is_sticky();
++      }
++      if (!has_sticky) {
++        break;
++      }
++      index = static_cast<int>(range.end());
++      continue;
++    }
 +    StickyTabController* sticky = From(model.GetTabAtIndex(index));
 +    if (!sticky || !sticky->is_sticky()) {
 +      break;
 +    }
++    ++index;
 +  }
 +  return index;
 +}
@@ -423,17 +494,22 @@ index 0000000000..d5aed3f49b
 +    return;
 +  }
 +  TabStripModel* model = GetModel(tab());
-+  // Pinned tabs already live at the front. Split tabs must stay adjacent to
-+  // their partner, so they are not moved.
++  // Pinned tabs already live at the front. Grouped tabs stay in their group
++  // and the whole group moves to the end of the sticky run. Split tabs must
++  // stay adjacent to their partner, so they are not moved.
 +  // ponytail: split tabs become sticky in place; move the split if needed.
-+  if (model && !tab().IsPinned() && !tab().GetSplit()) {
-+    if (tab().GetGroup()) {
-+      model->RemoveFromGroup({model->GetIndexOfTab(&tab())});
-+    }
-+    // Computed before `sticky_` is set, so this tab is not part of the run.
++  if (model && !tab().IsPinned()) {
++    // Computed before `sticky_` is set, so this tab (and a group with no other
++    // sticky tab) is not part of the run yet.
 +    const int target = IndexOfFirstNonStickyTab(*model);
-+    model->MoveWebContentsAt(model->GetIndexOfTab(&tab()), target,
-+                             /*select_after_move=*/false);
++    if (std::optional<tab_groups::TabGroupId> group = tab().GetGroup()) {
++      if (static_cast<int>(GroupRange(*model, *group).start()) > target) {
++        model->MoveGroupTo(*group, target);
++      }
++    } else if (!tab().GetSplit()) {
++      model->MoveWebContentsAt(model->GetIndexOfTab(&tab()), target,
++                               /*select_after_move=*/false);
++    }
 +  }
 +  sticky_ = true;
 +  home_url_ = home_url;
@@ -822,7 +898,7 @@ index 17ab4e685b..e8023517b4 100644
    AddItem(TabStripModel::CommandToggleSiteMuted,
            will_mute ? l10n_util::GetPluralStringFUTF16(
 diff --git a/chrome/browser/ui/tabs/tab_strip_model.cc b/chrome/browser/ui/tabs/tab_strip_model.cc
-index f2f3415e6f..c4bbdac1cf 100644
+index f2f3415e6f..2607d2a10a 100644
 --- a/chrome/browser/ui/tabs/tab_strip_model.cc
 +++ b/chrome/browser/ui/tabs/tab_strip_model.cc
 @@ -66,6 +66,7 @@
@@ -892,6 +968,19 @@ index f2f3415e6f..c4bbdac1cf 100644
  }
  
  int TabStripModel::ConstrainMoveIndex(int index, bool pinned_tab) const {
+@@ -3922,7 +3957,11 @@ int TabStripModel::InsertTabAtImpl(
+   if (pin && selection_model_.focused_group().has_value()) {
+     had_pinned_tabs_in_focus_session_ = true;
+   }
+-  index = ConstrainInsertionIndex(index, pin);
++  // Sticky tabs: inserts into an explicit group (e.g. a link opened from a
++  // grouped tab) keep the caller's index so the group stays contiguous.
++  index = (group.has_value() && !pin)
++              ? std::clamp(index, IndexOfFirstNonPinnedTab(), count())
++              : ConstrainInsertionIndex(index, pin);
+ 
+   tabs::TabModel* const active_tab_model = GetActiveTabModel();
+ 
 diff --git a/chrome/browser/ui/views/tabs/common/tab_view.cc b/chrome/browser/ui/views/tabs/common/tab_view.cc
 index 5292c13b13..daed32f5fd 100644
 --- a/chrome/browser/ui/views/tabs/common/tab_view.cc
